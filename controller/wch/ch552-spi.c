@@ -471,12 +471,14 @@ static ufprog_status ch552_spi_cs(struct ufprog_interface *ch552dev, bool assert
 /* Streaming write: [cmd][len=4+pre][count24][pre_len][pre...] followed by
  * `count` raw data frames.
  *
- * Chip select is asserted here when the host has not already done it; it is
- * deliberately not released, because the public entry points
- * (ufprog_spi_mem_exec_op / ufprog_spi_generic_xfer) release it once the whole
- * message is done. */
+ * When `own_cs` is set the bridge owns chip select: run_stream() asserts it
+ * before the prefix and releases it after the data, so the host does not have
+ * to spend two extra USB transfers on explicit CS commands.  Otherwise the
+ * host asserts CS here and leaves it asserted, because the caller is building
+ * a multi-command sequence that must keep CS low (long prefixes, generic
+ * transfers). */
 static ufprog_status ch552_stream_write(struct ufprog_interface *ch552dev, const uint8_t *prefix, uint32_t pre_len,
-					const void *data, size_t len)
+					const void *data, size_t len, bool own_cs)
 {
 	uint8_t desc[4 + CH552_MAX_PREFIX];
 	uint32_t off, chunk;
@@ -492,7 +494,7 @@ static ufprog_status ch552_stream_write(struct ufprog_interface *ch552dev, const
 	if (pre_len)
 		memcpy(desc + 4, prefix, pre_len);
 
-	if (!ch552dev->cs_asserted)
+	if (!ch552dev->cs_asserted && !own_cs)
 		STATUS_CHECK_RET(ch552_spi_cs(ch552dev, true));
 
 	STATUS_CHECK_RET(ch552_send_cmd(ch552dev, CH552_CMD_STREAM_WRITE, desc, 4 + pre_len));
@@ -511,7 +513,7 @@ static ufprog_status ch552_stream_write(struct ufprog_interface *ch552dev, const
 /* Streaming read: same descriptor, then `count` bytes of data followed by a
  * single status byte.  CS handling is the same as for the write path. */
 static ufprog_status ch552_stream_read(struct ufprog_interface *ch552dev, const uint8_t *prefix, uint32_t pre_len,
-				       void *data, size_t len)
+				       void *data, size_t len, bool own_cs)
 {
 	uint8_t desc[4 + CH552_MAX_PREFIX];
 
@@ -526,7 +528,7 @@ static ufprog_status ch552_stream_read(struct ufprog_interface *ch552dev, const 
 	if (pre_len)
 		memcpy(desc + 4, prefix, pre_len);
 
-	if (!ch552dev->cs_asserted)
+	if (!ch552dev->cs_asserted && !own_cs)
 		STATUS_CHECK_RET(ch552_spi_cs(ch552dev, true));
 
 	STATUS_CHECK_RET(ch552_send_cmd(ch552dev, CH552_CMD_STREAM_READ, desc, 4 + pre_len));
@@ -550,9 +552,9 @@ static ufprog_status ch552_spi_generic_xfer_one(struct ufprog_interface *ch552de
 		STATUS_CHECK_RET(ufprog_spi_set_speed(ch552dev, xfer->speed, NULL));
 
 	if (xfer->dir == SPI_DATA_IN)
-		return ch552_stream_read(ch552dev, NULL, 0, xfer->buf.rx, xfer->len);
+		return ch552_stream_read(ch552dev, NULL, 0, xfer->buf.rx, xfer->len, false);
 
-	return ch552_stream_write(ch552dev, NULL, 0, xfer->buf.tx, xfer->len);
+	return ch552_stream_write(ch552dev, NULL, 0, xfer->buf.tx, xfer->len, false);
 }
 
 ufprog_status UFPROG_API ufprog_spi_generic_xfer(struct ufprog_interface *ch552dev,
@@ -579,7 +581,7 @@ ufprog_status UFPROG_API ufprog_spi_generic_xfer(struct ufprog_interface *ch552d
 		}
 
 		STATUS_CHECK_GOTO_RET(ch552_stream_read(ch552dev, xfers[0].buf.tx, xfers[0].len, xfers[1].buf.rx,
-						       xfers[1].len), ret, out);
+						       xfers[1].len, !ch552dev->cs_asserted), ret, out);
 
 		goto out;
 	}
@@ -727,7 +729,7 @@ static ufprog_status ch552_mem_send_long_prefix(struct ufprog_interface *ch552de
 		if (n > CH552_MAX_PREFIX)
 			n = CH552_MAX_PREFIX;
 
-		ret = ch552_stream_write(ch552dev, prefix + off, n, NULL, 0);
+		ret = ch552_stream_write(ch552dev, prefix + off, n, NULL, 0, false);
 		if (ret)
 			return ret;
 	}
@@ -750,18 +752,25 @@ ufprog_status UFPROG_API ufprog_spi_mem_exec_op(struct ufprog_interface *ch552de
 	STATUS_CHECK_GOTO_RET(ch552_mem_fill_prefix(op, prefix, &pre_len), ret, out);
 
 	if (pre_len <= CH552_MAX_PREFIX) {
-		/* One command carries the whole message. */
+		/* One command carries the whole message.  When the host does not
+		 * hold CS, let the bridge own it: run_stream() asserts CS before
+		 * the prefix and releases it after the data.  Skipping the two
+		 * explicit CS commands saves two USB transfers per flash
+		 * command, which is what short command/status operations cost
+		 * almost all of their time in. */
+		bool own_cs = !ch552dev->cs_asserted;
+
 		if (op->data.dir == SPI_DATA_IN && op->data.len)
-			ret = ch552_stream_read(ch552dev, prefix, pre_len, op->data.buf.rx, op->data.len);
+			ret = ch552_stream_read(ch552dev, prefix, pre_len, op->data.buf.rx, op->data.len, own_cs);
 		else
-			ret = ch552_stream_write(ch552dev, prefix, pre_len, op->data.buf.tx, op->data.len);
+			ret = ch552_stream_write(ch552dev, prefix, pre_len, op->data.buf.tx, op->data.len, own_cs);
 	} else {
 		STATUS_CHECK_GOTO_RET(ch552_mem_send_long_prefix(ch552dev, prefix, pre_len), ret, out);
 
 		if (op->data.dir == SPI_DATA_IN && op->data.len)
-			ret = ch552_stream_read(ch552dev, NULL, 0, op->data.buf.rx, op->data.len);
+			ret = ch552_stream_read(ch552dev, NULL, 0, op->data.buf.rx, op->data.len, false);
 		else
-			ret = ch552_stream_write(ch552dev, NULL, 0, op->data.buf.tx, op->data.len);
+			ret = ch552_stream_write(ch552dev, NULL, 0, op->data.buf.tx, op->data.len, false);
 	}
 
 out:
