@@ -2116,6 +2116,12 @@ static ufprog_status spi_nand_accel_read_pages(struct nand_chip *nand, uint32_t 
 		return spi_nand_ops_read_pages(nand, page, count, buf, flags, retcount);
 
 	if (snand->accel.nand_read_pages && spi_nand_accel_usable(snand) && count <= 0xffff) {
+		/* spi_nand_chip_read_pages() would do this; the accelerator is
+		 * called straight from the nand core, so apply the part's ECC
+		 * setting here.  Without it the chip returns uncorrected data and
+		 * never reports its ECC status. */
+		STATUS_CHECK_RET(spi_nand_ondie_ecc_control(snand, snand->state.ecc_enabled));
+
 		ret = spi_nand_accel_set_geometry(snand);
 		if (!ret)
 			ret = snand->accel.nand_read_pages(snand->accel.ifdev, page, count, buf);
@@ -2220,6 +2226,12 @@ static ufprog_status spi_nand_accel_write_pages(struct nand_chip *nand, uint32_t
 	}
 
 	if (snand->accel.nand_program_pages && spi_nand_accel_usable(snand) && count <= 0xffff) {
+		/* spi_nand_chip_write_page() would do this; the accelerator is called
+		 * straight from the nand core, so the part's ECC setting has to be
+		 * applied here.  Without it the chip neither generates parity nor
+		 * guards the page, so the OOB stays erased. */
+		STATUS_CHECK_RET(spi_nand_ondie_ecc_control(snand, snand->state.ecc_enabled));
+
 		ret = spi_nand_accel_set_geometry(snand);
 		if (!ret)
 			ret = snand->accel.nand_program_pages(snand->accel.ifdev, page, count, buf);
