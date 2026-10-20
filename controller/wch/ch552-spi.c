@@ -19,13 +19,10 @@
  * falls back to the generic path when they are not.
  */
 
-#include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 #include <ufprog/api_spi.h>
 #include <ufprog/config.h>
-#include <ufprog/endian.h>
 #include <ufprog/log.h>
 #include "ch552.h"
 
@@ -183,6 +180,26 @@ static ufprog_status ch552_ping(struct ufprog_interface *ch552dev)
 		return UFP_UNSUPPORTED;
 	}
 
+	ch552dev->proto_version = buf[4];
+
+	return UFP_OK;
+}
+
+/* Read back the SPI divider and mode the firmware is running with, so the
+ * driver's view matches the hardware from the first transfer on. */
+static ufprog_status ch552_get_spi_cfg(struct ufprog_interface *ch552dev)
+{
+	uint8_t buf[3];
+
+	STATUS_CHECK_RET(ch552_send_cmd(ch552dev, CH552_CMD_GET_SPI_CFG, NULL, 0));
+	STATUS_CHECK_RET(ch552_recv_reply(ch552dev, buf, sizeof(buf)));
+
+	if (buf[0] != CH552_ST_OK)
+		return UFP_DEVICE_IO_ERROR;
+
+	ch552dev->spi_div = buf[1] < 2 ? 2 : buf[1];
+	ch552dev->spi_mode3 = buf[2] ? 1 : 0;
+
 	return UFP_OK;
 }
 
@@ -201,12 +218,17 @@ ufprog_status ch552_spi_init(struct ufprog_interface *ch552dev, struct json_obje
 		ch552dev->spi_fsys_hz = fsys_hz;
 	}
 
-	/* A dead bulk endpoint is reported by the EP0 vendor request, so read
-	 * it first: it is the only diagnostic that still works then. */
-	STATUS_CHECK_RET(ch552_read_fw_status(ch552dev));
+	/* The EP0 vendor request is the only diagnostic that still works when the
+	 * bulk endpoints are dead, so read it first.  It is optional though: an
+	 * older build without it simply STALLs, and GET_INFO/PING below will
+	 * confirm the protocol version anyway. */
+	if (ch552_read_fw_status(ch552dev))
+		logm_warn("Bridge does not answer the firmware status request; "
+			  "an older firmware build may be running\n");
 
 	STATUS_CHECK_RET(ch552_ping(ch552dev));
 	STATUS_CHECK_RET(ch552_get_caps(ch552dev));
+	STATUS_CHECK_RET(ch552_get_spi_cfg(ch552dev));
 
 	logm_info("Bridge firmware v%u.%u, protocol v%u, capabilities 0x%02x%02x\n", ch552dev->fw_major,
 		  ch552dev->fw_minor, ch552dev->proto_version, ch552dev->caps_hi, ch552dev->caps_lo);
@@ -447,8 +469,12 @@ static ufprog_status ch552_spi_cs(struct ufprog_interface *ch552dev, bool assert
  *---------------------------------------------------------------*/
 
 /* Streaming write: [cmd][len=4+pre][count24][pre_len][pre...] followed by
- * `count` raw data frames.  CS is managed by the device because it is not
- * held by the host. */
+ * `count` raw data frames.
+ *
+ * Chip select is asserted here when the host has not already done it; it is
+ * deliberately not released, because the public entry points
+ * (ufprog_spi_mem_exec_op / ufprog_spi_generic_xfer) release it once the whole
+ * message is done. */
 static ufprog_status ch552_stream_write(struct ufprog_interface *ch552dev, const uint8_t *prefix, uint32_t pre_len,
 					const void *data, size_t len)
 {
@@ -479,21 +505,15 @@ static ufprog_status ch552_stream_write(struct ufprog_interface *ch552dev, const
 		STATUS_CHECK_RET(ch552_write(ch552dev->handle, (const uint8_t *)data + off, chunk, NULL));
 	}
 
-	STATUS_CHECK_RET(ch552_read_status(ch552dev, NULL));
-
-	if (!ch552dev->cs_asserted)
-		STATUS_CHECK_RET(ch552_spi_cs(ch552dev, false));
-
-	return UFP_OK;
+	return ch552_read_status(ch552dev, NULL);
 }
 
 /* Streaming read: same descriptor, then `count` bytes of data followed by a
- * single status byte. */
+ * single status byte.  CS handling is the same as for the write path. */
 static ufprog_status ch552_stream_read(struct ufprog_interface *ch552dev, const uint8_t *prefix, uint32_t pre_len,
 				       void *data, size_t len)
 {
 	uint8_t desc[4 + CH552_MAX_PREFIX];
-	ufprog_status ret;
 
 	if (pre_len > CH552_MAX_PREFIX)
 		return UFP_INVALID_PARAMETER;
@@ -513,22 +533,14 @@ static ufprog_status ch552_stream_read(struct ufprog_interface *ch552dev, const 
 
 	/* The data phase must be drained before the status byte, otherwise the
 	 * status would be interpreted as data. */
-	STATUS_CHECK_GOTO_RET(ch552_recv_reply(ch552dev, data, len), ret, out);
+	STATUS_CHECK_RET(ch552_recv_reply(ch552dev, data, len));
 
-	ret = ch552_read_status(ch552dev, NULL);
-
-out:
-	if (!ch552dev->cs_asserted)
-		STATUS_CHECK_RET(ch552_spi_cs(ch552dev, false));
-
-	return ret;
+	return ch552_read_status(ch552dev, NULL);
 }
 
 static ufprog_status ch552_spi_generic_xfer_one(struct ufprog_interface *ch552dev,
 						const struct ufprog_spi_transfer *xfer)
 {
-	uint8_t prefix[CH552_MAX_PREFIX];
-
 	if (xfer->buswidth > 1 || xfer->dtr) {
 		logm_err("Only single I/O single rate is supported\n");
 		return UFP_UNSUPPORTED;
@@ -537,12 +549,10 @@ static ufprog_status ch552_spi_generic_xfer_one(struct ufprog_interface *ch552de
 	if (xfer->speed)
 		STATUS_CHECK_RET(ufprog_spi_set_speed(ch552dev, xfer->speed, NULL));
 
-	memset(prefix, 0xff, sizeof(prefix));
-
 	if (xfer->dir == SPI_DATA_IN)
-		return ch552_stream_read(ch552dev, prefix, 0, xfer->buf.rx, xfer->len);
+		return ch552_stream_read(ch552dev, NULL, 0, xfer->buf.rx, xfer->len);
 
-	return ch552_stream_write(ch552dev, prefix, 0, xfer->buf.tx, xfer->len);
+	return ch552_stream_write(ch552dev, NULL, 0, xfer->buf.tx, xfer->len);
 }
 
 ufprog_status UFPROG_API ufprog_spi_generic_xfer(struct ufprog_interface *ch552dev,
@@ -602,6 +612,12 @@ out:
  * plus the data frames and nothing else.                       *
  *---------------------------------------------------------------*/
 
+/* Longest prefix we accept in one SPI-MEM op.  The streaming command carries
+ * at most CH552_MAX_PREFIX bytes inline; anything longer is clocked out with
+ * extra prefix-only commands while the host holds CS. */
+#define CH552_MAX_PREFIX_TOTAL			32
+
+/* Build the raw byte sequence of the command, address and dummy phases. */
 static ufprog_status ch552_mem_fill_prefix(const struct ufprog_spi_mem_op *op, uint8_t *prefix, uint32_t *pre_len)
 {
 	uint32_t n = 0;
@@ -609,6 +625,9 @@ static ufprog_status ch552_mem_fill_prefix(const struct ufprog_spi_mem_op *op, u
 
 	if (op->cmd.len) {
 		if (op->cmd.len > 2 || op->cmd.buswidth != 1 || op->cmd.dtr)
+			return UFP_UNSUPPORTED;
+
+		if (n + op->cmd.len > CH552_MAX_PREFIX_TOTAL)
 			return UFP_UNSUPPORTED;
 
 		for (i = 0; i < op->cmd.len; i++)
@@ -619,12 +638,18 @@ static ufprog_status ch552_mem_fill_prefix(const struct ufprog_spi_mem_op *op, u
 		if (op->addr.len > 4 || op->addr.buswidth != 1 || op->addr.dtr)
 			return UFP_UNSUPPORTED;
 
+		if (n + op->addr.len > CH552_MAX_PREFIX_TOTAL)
+			return UFP_UNSUPPORTED;
+
 		for (i = 0; i < op->addr.len; i++)
 			prefix[n++] = (op->addr.val >> (8 * (op->addr.len - i - 1))) & 0xff;
 	}
 
 	if (op->dummy.len) {
 		if (op->dummy.buswidth != 1 || op->dummy.dtr)
+			return UFP_UNSUPPORTED;
+
+		if (n + op->dummy.len > CH552_MAX_PREFIX_TOTAL)
 			return UFP_UNSUPPORTED;
 
 		for (i = 0; i < op->dummy.len; i++)
@@ -639,7 +664,7 @@ static ufprog_status ch552_mem_fill_prefix(const struct ufprog_spi_mem_op *op, u
 ufprog_status UFPROG_API ufprog_spi_mem_supports_op(struct ufprog_interface *ch552dev,
 						    const struct ufprog_spi_mem_op *op)
 {
-	uint8_t prefix[CH552_MAX_PREFIX];
+	uint8_t prefix[CH552_MAX_PREFIX_TOTAL];
 	uint32_t pre_len;
 	size_t total;
 
@@ -666,7 +691,7 @@ ufprog_status UFPROG_API ufprog_spi_mem_supports_op(struct ufprog_interface *ch5
 ufprog_status UFPROG_API ufprog_spi_mem_adjust_op_size(struct ufprog_interface *ch552dev,
 						       struct ufprog_spi_mem_op *op)
 {
-	uint8_t prefix[CH552_MAX_PREFIX];
+	uint8_t prefix[CH552_MAX_PREFIX_TOTAL];
 	uint32_t pre_len;
 	size_t room;
 
@@ -687,10 +712,33 @@ ufprog_status UFPROG_API ufprog_spi_mem_adjust_op_size(struct ufprog_interface *
 	return UFP_OK;
 }
 
+/* Clock out a prefix longer than a single stream command can carry: hold CS
+ * and send it as a series of prefix-only stream writes. */
+static ufprog_status ch552_mem_send_long_prefix(struct ufprog_interface *ch552dev, const uint8_t *prefix,
+						uint32_t pre_len)
+{
+	uint32_t off, n;
+	ufprog_status ret;
+
+	STATUS_CHECK_RET(ch552_spi_cs(ch552dev, true));
+
+	for (off = 0; off < pre_len; off += n) {
+		n = pre_len - off;
+		if (n > CH552_MAX_PREFIX)
+			n = CH552_MAX_PREFIX;
+
+		ret = ch552_stream_write(ch552dev, prefix + off, n, NULL, 0);
+		if (ret)
+			return ret;
+	}
+
+	return UFP_OK;
+}
+
 ufprog_status UFPROG_API ufprog_spi_mem_exec_op(struct ufprog_interface *ch552dev,
 						const struct ufprog_spi_mem_op *op)
 {
-	uint8_t prefix[CH552_MAX_PREFIX];
+	uint8_t prefix[CH552_MAX_PREFIX_TOTAL];
 	uint32_t pre_len;
 	ufprog_status ret;
 
@@ -701,13 +749,19 @@ ufprog_status UFPROG_API ufprog_spi_mem_exec_op(struct ufprog_interface *ch552de
 
 	STATUS_CHECK_GOTO_RET(ch552_mem_fill_prefix(op, prefix, &pre_len), ret, out);
 
-	if (op->data.dir == SPI_DATA_IN) {
-		if (op->data.len)
+	if (pre_len <= CH552_MAX_PREFIX) {
+		/* One command carries the whole message. */
+		if (op->data.dir == SPI_DATA_IN && op->data.len)
 			ret = ch552_stream_read(ch552dev, prefix, pre_len, op->data.buf.rx, op->data.len);
 		else
-			ret = ch552_stream_write(ch552dev, prefix, pre_len, NULL, 0);
+			ret = ch552_stream_write(ch552dev, prefix, pre_len, op->data.buf.tx, op->data.len);
 	} else {
-		ret = ch552_stream_write(ch552dev, prefix, pre_len, op->data.buf.tx, op->data.len);
+		STATUS_CHECK_GOTO_RET(ch552_mem_send_long_prefix(ch552dev, prefix, pre_len), ret, out);
+
+		if (op->data.dir == SPI_DATA_IN && op->data.len)
+			ret = ch552_stream_read(ch552dev, NULL, 0, op->data.buf.rx, op->data.len);
+		else
+			ret = ch552_stream_write(ch552dev, NULL, 0, op->data.buf.tx, op->data.len);
 	}
 
 out:

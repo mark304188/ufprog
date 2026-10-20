@@ -20,9 +20,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <ufprog/device.h>
 #include <ufprog/driver.h>
 #include <ufprog/osdef.h>
+#include <ufprog/spi.h>
 
 #ifdef __cplusplus
 extern "C" {

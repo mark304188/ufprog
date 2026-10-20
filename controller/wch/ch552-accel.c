@@ -130,7 +130,7 @@ ufprog_status UFPROG_API ch552_nor_program(struct ufprog_interface *ch552dev, ui
 	if (!ch552_has_nor_accel(ch552dev))
 		return UFP_UNSUPPORTED;
 
-	if (!len || len > 0xffffff || addr > 0xffffff)
+	if (!len || len > 0xffffff || addr > 0xffffff || addr + len > 0x1000000ULL)
 		return UFP_INVALID_PARAMETER;
 
 	os_mutex_lock(ch552dev->lock);
@@ -171,7 +171,8 @@ ufprog_status UFPROG_API ch552_nor_erase(struct ufprog_interface *ch552dev, uint
 
 	/* The device erases whole 4 KiB sectors and needs both fields to be
 	 * sector aligned. */
-	if (!len || len > 0xffffff || addr > 0xffffff || (addr & 0xfff) || (len & 0xfff))
+	if (!len || len > 0xffffff || addr > 0xffffff || (addr & 0xfff) || (len & 0xfff) ||
+	    addr + len > 0x1000000ULL)
 		return UFP_INVALID_PARAMETER;
 
 	os_mutex_lock(ch552dev->lock);
