@@ -32,6 +32,10 @@ static ufprog_status spi_nand_accel_read_pages(struct nand_chip *nand, uint32_t 
 					       uint32_t flags, uint32_t *retcount);
 static ufprog_status spi_nand_ops_write_page(struct nand_chip *nand, uint32_t page, uint32_t column, uint32_t len,
 					     const void *buf);
+static ufprog_status spi_nand_chip_write_page(struct spi_nand *snand, uint32_t page, uint32_t column, uint32_t len,
+					      const void *data, bool enable_ecc);
+static ufprog_status spi_nand_accel_write_pages(struct nand_chip *nand, uint32_t page, uint32_t count,
+						const void *buf, bool ignore_error, uint32_t *retcount);
 static ufprog_status spi_nand_ops_erase_block(struct nand_chip *nand, uint32_t page);
 static ufprog_status spi_nand_ops_select_die(struct nand_chip *nand, uint32_t ce, uint32_t lun);
 static ufprog_status spi_nand_ops_read_uid(struct nand_chip *nand, void *data, uint32_t *retlen);
@@ -1271,6 +1275,13 @@ static ufprog_status spi_nand_setup_param_final(struct spi_nand *snand, const st
 		 * trips on a bridge that can run the loop itself. */
 		snand->nand.read_pages = spi_nand_accel_read_pages;
 
+	if (snand->accel.nand_program_pages)
+		/* Same idea for programming: one command covers a whole run of
+		 * pages.  The wrapper falls back to the per-page loop when a host
+		 * ECC engine is attached, because that one has to transform every
+		 * page before it is written. */
+		snand->nand.write_pages = spi_nand_accel_write_pages;
+
 	/* Setup default On-die ECC */
 	STATUS_CHECK_RET(spi_nand_setup_on_die_ecc(snand, vendor, part));
 
@@ -2144,6 +2155,107 @@ static ufprog_status spi_nand_accel_read_pages(struct nand_chip *nand, uint32_t 
 
 	if (retcount)
 		*retcount = done;
+
+	return ret;
+}
+
+/* Multi-page program through the controller accelerator.  ufprog_nand_write_pages()
+ * skips its per-page ECC encoding once write_pages is installed, so the encode
+ * is reproduced here for the host-ECC case; with the part's own ECC engine
+ * (or none) the pages are passed through untouched, which is what the device
+ * expects. */
+static ufprog_status spi_nand_accel_write_pages(struct nand_chip *nand, uint32_t page, uint32_t count,
+						const void *buf, bool ignore_error, uint32_t *retcount)
+{
+	struct spi_nand *snand = container_of(nand, struct spi_nand, nand);
+	const uint8_t *p = buf;
+	ufprog_status ret = UFP_OK;
+	uint32_t i, wrcnt = 0;
+
+	if (retcount)
+		*retcount = 0;
+
+	if (!count)
+		return UFP_OK;
+
+	/* A host ECC plugin has to rewrite every page, so keep the per-page path
+	 * (including the encoding the nand core would have done). */
+	if (nand->ecc && nand->ecc != &snand->ecc) {
+		for (i = 0; i < count; i++) {
+			const void *data = p;
+
+			if (nand->ecc->encode_page) {
+				void *tmp = nand->page_cache[0];
+
+				memcpy(tmp, p, nand->maux.oob_page_size);
+
+				ret = ufprog_ecc_encode_page(nand->ecc, tmp);
+				if (ret) {
+					if (!ignore_error)
+						break;
+
+					ret = UFP_OK;
+				}
+
+				data = tmp;
+			}
+
+			ret = spi_nand_chip_write_page(snand, page + i, 0, nand->maux.oob_page_size, data,
+						       snand->state.ecc_enabled);
+			if (ret) {
+				if (!ignore_error)
+					break;
+
+				ret = UFP_OK;
+			}
+
+			wrcnt++;
+			p += nand->maux.oob_page_size;
+		}
+
+		if (retcount)
+			*retcount = wrcnt;
+
+		return ret;
+	}
+
+	if (snand->accel.nand_program_pages && spi_nand_accel_usable(snand) && count <= 0xffff) {
+		ret = spi_nand_accel_set_geometry(snand);
+		if (!ret)
+			ret = snand->accel.nand_program_pages(snand->accel.ifdev, page, count, buf);
+
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated multi-page NAND program failed\n");
+			return ret;
+		}
+
+		if (!ret) {
+			if (retcount)
+				*retcount = count;
+
+			return UFP_OK;
+		}
+
+		logm_dbg("Controller rejected the accelerated multi-page program, using per-page writes\n");
+	}
+
+	/* Generic fallback: one page per call. */
+	for (i = 0; i < count; i++) {
+		ret = spi_nand_chip_write_page(snand, page + i, 0, nand->maux.oob_page_size, p,
+					       snand->state.ecc_enabled);
+		if (ret) {
+			if (!ignore_error)
+				break;
+
+			ret = UFP_OK;
+		}
+
+		wrcnt++;
+		p += nand->maux.oob_page_size;
+	}
+
+	if (retcount)
+		*retcount = wrcnt;
 
 	return ret;
 }
