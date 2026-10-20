@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <ufprog/spi.h>
 #include <ufprog/spi-nand.h>
+#include <ufprog/controller_accel.h>
 #include <ufprog/spi-nand-opcode.h>
 #include <ufprog/onfi-param-page.h>
 #include <ecc-internal.h>
@@ -140,6 +141,8 @@ struct spi_nand {
 	uint32_t max_speed;
 	uint32_t allowed_io_caps;
 	uint32_t config;
+
+	struct ufprog_controller_accel accel;
 
 	struct spi_nand_onfi onfi;
 	struct spi_nand_param param;

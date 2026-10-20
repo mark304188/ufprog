@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <ufprog/spi.h>
 #include <ufprog/spi-nor.h>
+#include <ufprog/controller_accel.h>
 #include "vendor.h"
 #include "sfdp.h"
 #include "regs.h"
@@ -149,6 +150,8 @@ struct spi_nor {
 	struct ufprog_spi *spi;
 	uint32_t max_speed;
 	uint32_t allowed_io_caps;
+
+	struct ufprog_controller_accel accel;
 
 	struct spi_nor_sfdp sfdp;
 	struct spi_nor_param param;

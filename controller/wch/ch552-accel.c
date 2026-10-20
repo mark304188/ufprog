@@ -269,6 +269,9 @@ ufprog_status UFPROG_API ch552_nand_read_pages(struct ufprog_interface *ch552dev
 	if (!ch552_has_nand_accel(ch552dev))
 		return UFP_UNSUPPORTED;
 
+	if (!ch552dev->nand_geom_set)
+		return UFP_UNSUPPORTED;
+
 	if (!count || page > 0xffffff || count > 0xffff)
 		return UFP_INVALID_PARAMETER;
 
@@ -314,6 +317,9 @@ ufprog_status UFPROG_API ch552_nand_program_pages(struct ufprog_interface *ch552
 		return UFP_INVALID_PARAMETER;
 
 	if (!ch552_has_nand_accel(ch552dev))
+		return UFP_UNSUPPORTED;
+
+	if (!ch552dev->nand_geom_set)
 		return UFP_UNSUPPORTED;
 
 	if (!count || page > 0xffffff || count > 0xffff)

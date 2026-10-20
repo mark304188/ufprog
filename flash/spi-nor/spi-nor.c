@@ -85,6 +85,8 @@ ufprog_status UFPROG_API ufprog_spi_nor_attach(struct spi_nor *snor, struct ufpr
 
 	snor->spi = spi;
 
+	ufprog_controller_accel_init(&snor->accel, spi);
+
 	return UFP_OK;
 }
 
@@ -2695,6 +2697,7 @@ static ufprog_status spi_nor_page_program(struct spi_nor *snor, uint64_t addr, s
 					  size_t *retlen)
 {
 	size_t proglen;
+	ufprog_status ret;
 
 	struct ufprog_spi_mem_op op = SPI_MEM_OP(
 		SPI_MEM_OP_CMD(snor->state.pp_opcode, spi_mem_io_info_cmd_bw(snor->state.pp_io_info)),
@@ -2709,6 +2712,33 @@ static ufprog_status spi_nor_page_program(struct spi_nor *snor, uint64_t addr, s
 
 	len = proglen;
 	op.data.len = proglen;
+
+	/* Let the controller run the whole page loop when it can.  This is only
+	 * correct for the plain single I/O case: the device has no notion of
+	 * dual/quad page program, and it always uses the 24 bit address form.
+	 * Chips needing a special sequence (4 byte addressing, no WREN, ...) are
+	 * left to the generic path as well. */
+	if (snor->accel.nor_program && snor->state.naddr == 3 &&
+	    spi_mem_io_info_cmd_bw(snor->state.pp_io_info) == 1 &&
+	    spi_mem_io_info_data_bw(snor->state.pp_io_info) == 1 &&
+	    spi_mem_io_info_addr_bw(snor->state.pp_io_info) == 1 && addr + proglen <= 0x1000000ULL &&
+	    !snor->state.a4b_mode && snor->state.curr_high_addr == 0 &&
+	    !(snor->param.flags & SNOR_F_NO_WREN)) {
+		ret = snor->accel.nor_program(snor->accel.ifdev, addr, proglen, data);
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated page program failed\n");
+			return ret;
+		}
+
+		if (!ret) {
+			if (retlen)
+				*retlen = len;
+
+			return UFP_OK;
+		}
+
+		logm_dbg("Controller rejected the accelerated page program, using the generic path\n");
+	}
 
 	while (proglen) {
 		STATUS_CHECK_RET(spi_nor_setup_addr(snor, &op.addr.val));
@@ -2906,6 +2936,25 @@ static ufprog_status spi_nor_erase_block(struct spi_nor *snor, uint64_t addr, co
 		SPI_MEM_OP_NO_DUMMY,
 		SPI_MEM_OP_NO_DATA
 	);
+	ufprog_status ret;
+
+	/* The device only knows the 4 KiB sector erase, so hand the whole
+	 * operation over only when that is what would be issued anyway. */
+	if (snor->accel.nor_erase && ei->size == SZ_4K && ei->opcode == SNOR_CMD_SECTOR_ERASE &&
+	    snor->state.naddr == 3 && snor->state.cmd_buswidth_curr == 1 && addr <= 0xfffffffffULL &&
+	    !snor->state.a4b_mode && snor->state.curr_high_addr == 0 &&
+	    !(snor->param.flags & SNOR_F_NO_WREN)) {
+		ret = snor->accel.nor_erase(snor->accel.ifdev, addr, ei->size);
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated sector erase failed\n");
+			return ret;
+		}
+
+		if (!ret)
+			return UFP_OK;
+
+		logm_dbg("Controller rejected the accelerated sector erase, using the generic path\n");
+	}
 
 	STATUS_CHECK_RET(spi_nor_set_low_speed(snor));
 	STATUS_CHECK_RET(spi_nor_setup_addr(snor, &op.addr.val));

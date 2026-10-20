@@ -192,7 +192,7 @@ ufprog_status ch552_spi_init(struct ufprog_interface *ch552dev, struct json_obje
 
 	/* Optional: a firmware built for 12 MHz (3.3 V only boards) reports a
 	 * different system clock, and the SPI divider is relative to it. */
-	if (!json_read_uint32(config, "sysclk-hz", &fsys_hz, 0)) {
+	if (config && !json_read_uint32(config, "sysclk-hz", &fsys_hz, 0)) {
 		if (fsys_hz < 1000000 || fsys_hz > 48000000) {
 			logm_err("Invalid 'sysclk-hz' %u in SPI configuration\n", fsys_hz);
 			return UFP_DEVICE_INVALID_CONFIG;

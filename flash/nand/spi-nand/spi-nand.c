@@ -28,6 +28,8 @@ static ufprog_status spi_nand_ops_read_page(struct nand_chip *nand, uint32_t pag
 					    void *buf);
 static ufprog_status spi_nand_ops_read_pages(struct nand_chip *nand, uint32_t page, uint32_t count, void *buf,
 					     uint32_t flags, uint32_t *retcount);
+static ufprog_status spi_nand_accel_read_pages(struct nand_chip *nand, uint32_t page, uint32_t count, void *buf,
+					       uint32_t flags, uint32_t *retcount);
 static ufprog_status spi_nand_ops_write_page(struct nand_chip *nand, uint32_t page, uint32_t column, uint32_t len,
 					     const void *buf);
 static ufprog_status spi_nand_ops_erase_block(struct nand_chip *nand, uint32_t page);
@@ -79,6 +81,8 @@ ufprog_status UFPROG_API ufprog_spi_nand_attach(struct spi_nand *snand, struct u
 	}
 
 	snand->spi = spi;
+
+	ufprog_controller_accel_init(&snand->accel, spi);
 
 	return UFP_OK;
 }
@@ -1261,6 +1265,11 @@ static ufprog_status spi_nand_setup_param_final(struct spi_nand *snand, const st
 	if ((snand->param.flags & (SNAND_F_READ_CACHE_RANDOM | SNAND_F_READ_CACHE_SEQ)) &&
 	    (snand->config & SPI_NAND_CFG_DIRECT_MULTI_PAGE_READ))
 		snand->nand.read_pages = spi_nand_ops_read_pages;
+	else if (snand->accel.nand_read_pages)
+		/* Let the controller read a whole run of pages with one command.
+		 * This is what removes the per-page PAGE READ + OIP poll round
+		 * trips on a bridge that can run the loop itself. */
+		snand->nand.read_pages = spi_nand_accel_read_pages;
 
 	/* Setup default On-die ECC */
 	STATUS_CHECK_RET(spi_nand_setup_on_die_ecc(snand, vendor, part));
@@ -1803,10 +1812,82 @@ ufprog_status spi_nand_read_cache_single(struct spi_nand *snand, uint32_t column
 					  ufprog_spi_mem_io_bus_width_info(SPI_MEM_IO_1_1_1), column, len, data);
 }
 
+/*---------------------------------------------------------------*
+ * Controller-side page accelerators                             *
+ *                                                               *
+ * The device commands always use the plain single I/O opcodes:  *
+ * READ FROM CACHE 0x03 with one dummy byte, PROGRAM LOAD 0x02   *
+ * without one.  They are only usable when that is exactly what  *
+ * the generic path would have issued, and when the page fits    *
+ * the 16 bit page-count field of the protocol.                  *
+ *---------------------------------------------------------------*/
+
+static bool spi_nand_accel_usable(struct spi_nand *snand)
+{
+	if (snand->state.rd_io_info != ufprog_spi_mem_io_bus_width_info(SPI_MEM_IO_1_1_1))
+		return false;
+
+	if (snand->state.pl_io_info != ufprog_spi_mem_io_bus_width_info(SPI_MEM_IO_1_1_1))
+		return false;
+
+	if (snand->state.rd_opcode.opcode != SNAND_CMD_FAST_READ_FROM_CACHE ||
+	    snand->state.rd_opcode.ndummy != 8 || snand->state.rd_opcode.naddrs != 2)
+		return false;
+
+	if (snand->state.pl_opcode.opcode != SNAND_CMD_PROGRAM_LOAD ||
+	    snand->state.pl_opcode.ndummy != 0 || snand->state.pl_opcode.naddrs != 2)
+		return false;
+
+	if (snand->nand.memorg.num_chips != 1 || snand->nand.memorg.luns_per_cs != 1)
+		return false;
+
+	if (snand->nand.memorg.planes_per_lun != 1)
+		return false;
+
+	return true;
+}
+
+static ufprog_status spi_nand_accel_set_geometry(struct spi_nand *snand)
+{
+	uint32_t page_size = snand->nand.memorg.page_size, oob_size = snand->nand.memorg.oob_size;
+
+	if (!snand->accel.nand_set_geometry)
+		return UFP_UNSUPPORTED;
+
+	if (snand->accel.nand_geometry_matches(snand->accel.ifdev, page_size, oob_size))
+		return UFP_OK;
+
+	return snand->accel.nand_set_geometry(snand->accel.ifdev, page_size, oob_size);
+}
+
 static ufprog_status spi_nand_die_read_page(struct spi_nand *snand, uint32_t page, uint32_t column, uint32_t len,
 					    void *data, bool check_ecc)
 {
 	ufprog_status ret;
+
+	/* The device command reads a whole page (main area + OOB) with the plain
+	 * READ FROM CACHE form, so it can only be used when that is exactly what
+	 * would have been issued anyway. */
+	if (snand->accel.nand_read_pages && column == 0 && len == snand->nand.maux.oob_page_size &&
+	    spi_nand_accel_usable(snand)) {
+		ret = spi_nand_accel_set_geometry(snand);
+		if (!ret)
+			ret = snand->accel.nand_read_pages(snand->accel.ifdev, page, 1, data);
+
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated NAND page read failed\n");
+			return ret;
+		}
+
+		if (!ret) {
+			if (check_ecc)
+				snand->ecc_ret = snand->ext_param.ops.check_ecc(snand);
+
+			return UFP_OK;
+		}
+
+		logm_dbg("Controller rejected the accelerated NAND page read, using the generic path\n");
+	}
 
 	column |= spi_nand_get_plane_address(snand, page);
 
@@ -1845,6 +1926,32 @@ static ufprog_status spi_nand_die_read_pages(struct spi_nand *snand, uint32_t pa
 	uint32_t column, rdcnt = 0;
 	bool seq_mode = false;
 	ufprog_status ret;
+
+	/* The device command reads consecutive pages one by one, which is a
+	 * strict subset of what the generic path can express.  Use it whenever it
+	 * applies: it keeps the whole read inside the device. */
+	if (snand->accel.nand_read_pages && spi_nand_accel_usable(snand) && count <= 0xffff) {
+		ret = spi_nand_accel_set_geometry(snand);
+		if (!ret)
+			ret = snand->accel.nand_read_pages(snand->accel.ifdev, page, count, buf);
+
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated multi-page NAND read failed\n");
+			return ret;
+		}
+
+		if (!ret) {
+			if (check_ecc)
+				snand->ecc_ret = snand->ext_param.ops.check_ecc(snand);
+
+			if (retcount)
+				*retcount = count;
+
+			return UFP_OK;
+		}
+
+		logm_dbg("Controller rejected the accelerated multi-page NAND read, using the generic path\n");
+	}
 
 	if (snand->param.flags & SNAND_F_READ_CACHE_SEQ) {
 		seq_mode = true;
@@ -1983,6 +2090,64 @@ static ufprog_status spi_nand_ops_read_pages(struct nand_chip *nand, uint32_t pa
 	return spi_nand_chip_read_pages(snand, page, count, buf, snand->state.ecc_enabled, flags, retcount);
 }
 
+/* Multi-page read through the controller accelerator.  Falls back to the
+ * generic per-page loop when the controller refuses, so it is always safe to
+ * install this in place of the default implementation. */
+static ufprog_status spi_nand_accel_read_pages(struct nand_chip *nand, uint32_t page, uint32_t count, void *buf,
+					       uint32_t flags, uint32_t *retcount)
+{
+	struct spi_nand *snand = container_of(nand, struct spi_nand, nand);
+	ufprog_status ret;
+	uint32_t i, done = 0;
+	uint8_t *p = buf;
+
+	if (count == 1)
+		return spi_nand_ops_read_pages(nand, page, count, buf, flags, retcount);
+
+	if (snand->accel.nand_read_pages && spi_nand_accel_usable(snand) && count <= 0xffff) {
+		ret = spi_nand_accel_set_geometry(snand);
+		if (!ret)
+			ret = snand->accel.nand_read_pages(snand->accel.ifdev, page, count, buf);
+
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated multi-page NAND read failed\n");
+			return ret;
+		}
+
+		if (!ret) {
+			if (snand->state.ecc_enabled && snand->ext_param.ops.check_ecc)
+				snand->ecc_ret = snand->ext_param.ops.check_ecc(snand);
+
+			if (retcount)
+				*retcount = count;
+
+			return UFP_OK;
+		}
+
+		logm_dbg("Controller rejected the accelerated multi-page read, using per-page reads\n");
+	}
+
+	/* Generic fallback: one page per call. */
+	for (i = 0; i < count; i++) {
+		ret = spi_nand_chip_read_page(snand, page + i, 0, nand->maux.oob_page_size, p,
+					      snand->state.ecc_enabled);
+		if (ret) {
+			if (!(flags & NAND_READ_F_IGNORE_IO_ERROR))
+				break;
+
+			ret = UFP_OK;
+		}
+
+		p += nand->maux.oob_page_size;
+		done++;
+	}
+
+	if (retcount)
+		*retcount = done;
+
+	return ret;
+}
+
 ufprog_status spi_nand_program_load_custom(struct spi_nand *snand, const struct spi_nand_io_opcode *pl_opcode,
 					   const struct spi_nand_io_opcode *upd_opcode, uint32_t io_info,
 					   uint32_t column, uint32_t len, const void *data)
@@ -2031,6 +2196,26 @@ static ufprog_status spi_nand_die_write_page(struct spi_nand *snand, uint32_t pa
 {
 	ufprog_status ret;
 	uint8_t sr;
+
+	/* Only the whole page, single I/O, one plane, one die case can be handed
+	 * to the device: it always loads at column 0 and issues PROGRAM LOAD /
+	 * PROGRAM EXECUTE itself. */
+	if (snand->accel.nand_program_pages && column == 0 && len == snand->nand.maux.oob_page_size &&
+	    spi_nand_accel_usable(snand)) {
+		ret = spi_nand_accel_set_geometry(snand);
+		if (!ret)
+			ret = snand->accel.nand_program_pages(snand->accel.ifdev, page, 1, data);
+
+		if (ret && ret != UFP_UNSUPPORTED) {
+			logm_err("Controller-accelerated NAND page program failed\n");
+			return ret;
+		}
+
+		if (!ret)
+			return UFP_OK;
+
+		logm_dbg("Controller rejected the accelerated NAND page program, using the generic path\n");
+	}
 
 	column |= spi_nand_get_plane_address(snand, page);
 

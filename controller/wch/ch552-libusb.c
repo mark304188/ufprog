@@ -74,6 +74,7 @@ ufprog_status UFPROG_API ufprog_device_open(uint32_t if_type, struct json_object
 	struct libusb_device_handle *dev_handle = NULL;
 	struct ufprog_interface *ch552dev;
 	ufprog_status ret = UFP_OK;
+	struct json_object *ifcfg;
 	int err;
 
 	if (!outifdev)
@@ -117,8 +118,15 @@ ufprog_status UFPROG_API ufprog_device_open(uint32_t if_type, struct json_object
 		goto cleanup;
 	}
 
+	STATUS_CHECK_GOTO_RET(json_read_obj(config, "spi", &ifcfg), ret, cleanup_handle);
+
+	STATUS_CHECK_GOTO_RET(ch552_spi_init(ch552dev, ifcfg), ret, cleanup_handle);
+
 	*outifdev = ch552dev;
 	return UFP_OK;
+
+cleanup_handle:
+	libusb_release_interface(dev_handle, CH552_USB_INTERFACE);
 
 cleanup:
 	libusb_close(dev_handle);
