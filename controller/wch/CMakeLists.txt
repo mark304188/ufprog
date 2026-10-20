@@ -42,7 +42,15 @@ set(wch_libusb_files
 	presets/ch347t-libusb.json
 	presets/ch347f-libusb.json
 	presets/ch347-hid.json
+	presets/ch552-libusb.json
 )
+
+# CH552 USB-SPI bridge libusb
+add_library(ch552-libusb SHARED ch552-libusb.c ch552.c ch552-spi.c ch552-accel.c ch552-libusb.def)
+target_link_libraries(ch552-libusb PRIVATE ufprog_common ufprog_controller ${LIBUSB_LIB})
+target_include_directories(ch552-libusb PRIVATE ${libusb_common_SOURCE_DIR} ${LIBUSB_INC})
+target_compile_definitions(ch552-libusb PRIVATE UFP_MODULE_NAME=\"CH552-libusb\")
+set_target_properties(ch552-libusb PROPERTIES PREFIX "" OUTPUT_NAME "ch552-libusb")
 
 # CH341 libusb
 add_library(ch341-libusb SHARED ch341-libusb.c ${ch341_common_src} ch341-libusb.def)
@@ -65,7 +73,7 @@ target_include_directories(ch347-hid PRIVATE ${libusb_common_SOURCE_DIR} ${HIDAP
 target_compile_definitions(ch347-hid PRIVATE UFP_MODULE_NAME=\"CH347-HID\")
 set_target_properties(ch347-hid PROPERTIES PREFIX "" OUTPUT_NAME "ch347-hid")
 
-install(TARGETS ch341-libusb ch347-libusb ch347-hid
+install(TARGETS ch552-libusb ch341-libusb ch347-libusb ch347-hid
 	RUNTIME DESTINATION ${CONTROLLER_DRIVER_DIR}
 	LIBRARY DESTINATION ${CONTROLLER_DRIVER_DIR}
 )

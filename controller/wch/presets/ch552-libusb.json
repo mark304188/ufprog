@@ -1,0 +1,13 @@
+{
+	"driver": "ch552-libusb",
+	"if_type": [ "spi" ],
+	"config": {
+		"match": [
+			{
+			}
+		],
+		"spi": {
+			"sysclk-hz": 24000000
+		}
+	}
+}
