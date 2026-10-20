@@ -2696,7 +2696,7 @@ out:
 static ufprog_status spi_nor_page_program(struct spi_nor *snor, uint64_t addr, size_t len, const void *data,
 					  size_t *retlen)
 {
-	size_t proglen;
+	size_t proglen, reqlen = len;
 	ufprog_status ret;
 
 	struct ufprog_spi_mem_op op = SPI_MEM_OP(
@@ -2706,25 +2706,22 @@ static ufprog_status spi_nor_page_program(struct spi_nor *snor, uint64_t addr, s
 		SPI_MEM_OP_DATA_OUT(0, data, spi_mem_io_info_data_bw(snor->state.pp_io_info))
 	);
 
-	proglen = snor->param.page_size - (addr & (snor->param.page_size - 1));
-	if (proglen > len)
-		proglen = len;
-
-	len = proglen;
-	op.data.len = proglen;
-
-	/* Let the controller run the whole page loop when it can.  This is only
-	 * correct for the plain single I/O case: the device has no notion of
-	 * dual/quad page program, and it always uses the 24 bit address form.
-	 * Chips needing a special sequence (4 byte addressing, no WREN, ...) are
-	 * left to the generic path as well. */
-	if (snor->accel.nor_program && snor->state.naddr == 3 &&
+	/* Let the controller run the whole page loop when it can, over the whole
+	 * requested range: the device splits it into pages itself, so one USB
+	 * command covers many pages instead of one round trip per page.
+	 *
+	 * This is only correct for the plain single I/O case: the device has no
+	 * notion of dual/quad page program and always uses the 24 bit address
+	 * form.  Chips needing a special sequence (4 byte addressing, no WREN,
+	 * another program opcode, ...) are left to the generic path as well. */
+	if (snor->accel.nor_program && reqlen && reqlen <= 0xffffff && snor->state.naddr == 3 &&
 	    spi_mem_io_info_cmd_bw(snor->state.pp_io_info) == 1 &&
+	    spi_mem_io_info_addr_bw(snor->state.pp_io_info) == 1 &&
 	    spi_mem_io_info_data_bw(snor->state.pp_io_info) == 1 &&
-	    spi_mem_io_info_addr_bw(snor->state.pp_io_info) == 1 && addr + proglen <= 0x1000000ULL &&
-	    !snor->state.a4b_mode && snor->state.curr_high_addr == 0 &&
+	    addr + reqlen <= 0x1000000ULL && !snor->state.a4b_mode && snor->state.curr_high_addr == 0 &&
+	    snor->param.page_size >= 256 && !(snor->param.page_size & 0xff) &&
 	    !(snor->param.flags & SNOR_F_NO_WREN)) {
-		ret = snor->accel.nor_program(snor->accel.ifdev, addr, proglen, data);
+		ret = snor->accel.nor_program(snor->accel.ifdev, addr, reqlen, data);
 		if (ret && ret != UFP_UNSUPPORTED) {
 			logm_err("Controller-accelerated page program failed\n");
 			return ret;
@@ -2732,13 +2729,20 @@ static ufprog_status spi_nor_page_program(struct spi_nor *snor, uint64_t addr, s
 
 		if (!ret) {
 			if (retlen)
-				*retlen = len;
+				*retlen = reqlen;
 
 			return UFP_OK;
 		}
 
 		logm_dbg("Controller rejected the accelerated page program, using the generic path\n");
 	}
+
+	proglen = snor->param.page_size - (addr & (snor->param.page_size - 1));
+	if (proglen > len)
+		proglen = len;
+
+	len = proglen;
+	op.data.len = proglen;
 
 	while (proglen) {
 		STATUS_CHECK_RET(spi_nor_setup_addr(snor, &op.addr.val));

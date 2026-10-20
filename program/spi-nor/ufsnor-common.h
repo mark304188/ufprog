@@ -19,7 +19,11 @@
 
 #define UFSNOR_MAX_SPEED				80000000
 #define UFSNOR_READ_GRANULARITY				0x10000
-#define UFSNOR_WRITE_GRANULARITY			0x200
+/* Write chunk handed to the SPI-NOR layer in one call.  The layer splits it
+ * at flash page boundaries itself, so a large chunk only means fewer outer
+ * iterations - and it lets a controller with a page-program accelerator cover
+ * many pages with a single command. */
+#define UFSNOR_WRITE_GRANULARITY			0x10000
 
 struct ufsnor_options {
 	uint32_t log_level;
